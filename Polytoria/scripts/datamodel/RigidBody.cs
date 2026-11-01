@@ -6,19 +6,21 @@ using Godot;
 using Polytoria.Attributes;
 using Polytoria.Utils;
 using System;
+using System.Collections.Generic;
 
 namespace Polytoria.Datamodel;
 
 [Instantiable]
 public partial class RigidBody : Physical
 {
+	private static readonly Dictionary<(float, float), PhysicsMaterial> _physicsMaterials = [];
 	internal RigidBody3D GDRigidBody = null!;
-	internal PhysicsMaterial PhysicsMat = null!;
+	private PhysicsMaterial? _appliedPhysicsMaterial;
 
-	private float _gravityScale;
+	private float _gravityScale = 1f;
 	private bool _lockRotation = false;
-	private float _mass;
-	private float _friction;
+	private float _mass = 1f;
+	private float _friction = 0.6f;
 	private float _drag;
 	private float _angularDrag;
 	private float _bounciness;
@@ -32,7 +34,10 @@ public partial class RigidBody : Physical
 		}
 		set
 		{
-			GDRigidBody.LinearVelocity = value;
+			if (!IsFrozen || GDRigidBody.LinearVelocity != value)
+			{
+				GDRigidBody.LinearVelocity = value;
+			}
 			OnPropertyChanged();
 		}
 	}
@@ -46,7 +51,11 @@ public partial class RigidBody : Physical
 		}
 		set
 		{
-			GDRigidBody.AngularVelocity = value.FlipEuler();
+			Vector3 v = value.FlipEuler();
+			if (!IsFrozen || GDRigidBody.AngularVelocity != v)
+			{
+				GDRigidBody.AngularVelocity = v;
+			}
 			OnPropertyChanged();
 		}
 	}
@@ -118,7 +127,7 @@ public partial class RigidBody : Physical
 			}
 
 			_friction = value;
-			PhysicsMat.Friction = value;
+			UpdatePhysicsMaterial();
 			OnPropertyChanged();
 		}
 	}
@@ -170,7 +179,7 @@ public partial class RigidBody : Physical
 
 			_bounciness = value;
 
-			PhysicsMat.Bounce = value;
+			UpdatePhysicsMaterial();
 
 			OnPropertyChanged();
 		}
@@ -182,6 +191,11 @@ public partial class RigidBody : Physical
 		get => _lockRotation;
 		set
 		{
+			if (_lockRotation == value)
+			{
+				return;
+			}
+
 			_lockRotation = value;
 
 			GDRigidBody.LockRotation = value;
@@ -198,10 +212,32 @@ public partial class RigidBody : Physical
 	public override void InitGDNode()
 	{
 		base.InitGDNode();
-		PhysicsMat = new();
+		RigidBody3D? previous = GDRigidBody;
 		GDRigidBody = (RigidBody3D)GDNode;
-		GDRigidBody.PhysicsMaterialOverride = PhysicsMat;
+		_appliedPhysicsMaterial = null;
+		UpdatePhysicsMaterial();
 		GDRigidBody.GravityScale = 2;
+
+		if (ReferenceEquals(previous, GDRigidBody)) return;
+
+		if (previous != null)
+		{
+			previous.SleepingStateChanged -= OnSleepingStateChanged;
+		}
+
+		GDRigidBody.SleepingStateChanged += OnSleepingStateChanged;
+	}
+
+	private void UpdatePhysicsMaterial()
+	{
+		if (!_physicsMaterials.TryGetValue((_friction, _bounciness), out PhysicsMaterial? mat))
+		{
+			mat = new() { Friction = _friction, Bounce = _bounciness };
+			_physicsMaterials[(_friction, _bounciness)] = mat;
+		}
+		if (ReferenceEquals(_appliedPhysicsMaterial, mat)) return;
+		_appliedPhysicsMaterial = mat;
+		GDRigidBody.PhysicsMaterialOverride = mat;
 	}
 
 	public override void Init()
@@ -209,6 +245,22 @@ public partial class RigidBody : Physical
 		base.Init();
 		Anchored = true;
 		CanCollide = true;
+	}
+
+	private void OnSleepingStateChanged()
+	{
+		if (IsAsleep && Root != null && Root.Network != null
+			&& NetTransformAuthority == Root.Network.LocalPeerID)
+		{
+			UpdateNetTransformReliable();
+
+			if (!Root.Network.IsServer)
+			{
+				SendNetTransformUnreliable(false);
+			}
+		}
+
+		UpdatePhysicsTick();
 	}
 
 	internal override void ApplyAddForce(Vector3 force, ForceModeEnum mode = ForceModeEnum.Force)
@@ -339,4 +391,7 @@ public partial class RigidBody : Physical
 		GDRigidBody.Freeze = to;
 		base.ApplyFreeze(to);
 	}
+
+	internal override bool IsAsleep => !GDRigidBody.Freeze && GDRigidBody.Sleeping;
+	internal override bool IsFrozen => GDRigidBody.Freeze;
 }

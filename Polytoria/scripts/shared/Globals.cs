@@ -10,16 +10,19 @@ using System.IO;
 #endif
 using Polytoria.Datamodel;
 using Polytoria.Datamodel.Resources;
+using Polytoria.Scripting.Luau;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using Mesh = Godot.Mesh;
-using System.Runtime.CompilerServices;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection.Metadata;
+using Polytoria.Extensions;
 
 namespace Polytoria.Shared;
 
@@ -66,7 +69,10 @@ public sealed partial class Globals : Node
 	private static readonly Dictionary<string, Material> _skyboxesCache = [];
 
 	private static readonly Dictionary<(Part.PartMaterialEnum, bool), Material> _materialCache = [];
-
+	private static readonly HashSet<string> _missingResources = [];
+	private readonly PriorityQueue<ScheduledWait, (ulong Target, ulong Order)> _waitQueue = new();
+	private ulong _nextWaitOrder;
+	private bool _processingWaits;
 	private static bool _isExiting = false;
 
 	public static bool IsExiting => _isExiting;
@@ -114,6 +120,10 @@ public sealed partial class Globals : Node
 	/// </summary>
 	public static bool IsMobileBuild { get; private set; } = false;
 	/// <summary>
+	/// Check if headless <3
+	/// </summary>
+	public static bool IsHeadless { get; private set; } = false;
+	/// <summary>
 	/// Check if Godot is available, this can be false in unit testing environments
 	/// </summary>
 	public static bool GDAvailable { get; private set; } = false;
@@ -124,13 +134,14 @@ public sealed partial class Globals : Node
 	public static event Action<double>? GodotPhysicsProcess;
 	public static event Action<int>? GodotNotification;
 
-	private readonly static ConditionalWeakTable<string, Type> _typesCache = [];
+	private readonly static ConcurrentDictionary<string, Type> _typesCache = [];
 
 	static Globals()
 	{
 		NativeLibrary.SetDllImportResolver(Assembly.GetExecutingAssembly(), DllImportResolver);
 
 		BaseAsset.RegisterGeneratedAssetTypes();
+		ScriptInterfaceInvokers.RegisterGenerated();
 	}
 
 	public override void _EnterTree()
@@ -142,6 +153,7 @@ public sealed partial class Globals : Node
 		IsServerBuild = OS.HasFeature("server");
 		IsInGDEditor = OS.HasFeature("editor");
 		IsMobileBuild = OS.HasFeature("mobile");
+		IsHeadless = DisplayServer.GetName() == "headless";
 
 		GDAvailable = true;
 
@@ -168,6 +180,8 @@ public sealed partial class Globals : Node
 		Polytoria.Private.PrivateNode pv = new();
 		AddChild(pv);
 #endif
+
+		RuntimeExtensions.Initialize();
 
 		// Initialize Native
 		try
@@ -226,6 +240,12 @@ public sealed partial class Globals : Node
 		if (_typesCache.TryGetValue(className, out Type? t))
 			return t;
 
+		if (TypeRegistry.InstantiableTypes.TryGetValue(className, out t))
+		{
+			_typesCache[className] = t;
+			return t;
+		}
+
 		string[] namespacesToCheck =
 		[
 			"Polytoria.Datamodel.",
@@ -239,7 +259,7 @@ public sealed partial class Globals : Node
 			t = Type.GetType(ns + className);
 			if (t != null)
 			{
-				_typesCache.AddOrUpdate(className, t);
+				_typesCache[className] = t;
 				return t;
 			}
 		}
@@ -338,11 +358,10 @@ public sealed partial class Globals : Node
 			return mat;
 		}
 
-		mat = ResourceLoader.Load<Material>($"res://resources/materials/parts/{material}.tres", cacheMode: ResourceLoader.CacheMode.IgnoreDeep);
+		mat = ResourceLoader.Load<Material>($"res://resources/materials/parts/{material}.tres", cacheMode: ResourceLoader.CacheMode.Ignore);
 		if (!isOpaque && mat is ShaderMaterial shadMat && shadMat.Shader.ResourcePath.EndsWith("part.gdshader"))
 		{
-			Shader shader = ResourceLoader.Load<Shader>("res://resources/shaders/part/part_transparent.gdshader", cacheMode: ResourceLoader.CacheMode.IgnoreDeep);
-			shadMat.Shader = shader;
+			shadMat.Shader = ResourceLoader.Load<Shader>("res://resources/shaders/part/part_transparent.gdshader");
 		}
 		_materialCache[(material, isOpaque)] = mat;
 		return mat;
@@ -371,8 +390,14 @@ public sealed partial class Globals : Node
 			return cachedResource;
 		}
 
+		if (_missingResources.Contains(path))
+		{
+			return null;
+		}
+
 		if (!ResourceLoader.Exists(path))
 		{
+			_missingResources.Add(path);
 			return null;
 		}
 
@@ -483,13 +508,62 @@ public sealed partial class Globals : Node
 		base._Notification(what);
 	}
 
-	public async Task WaitAsync(float time)
+	public Task WaitAsync(float time, CancellationToken cancellationToken = default)
 	{
-		var start = Time.GetTicksUsec();
-		var target = start + (ulong)(time * 1_000_000.0);
+		ulong start = Time.GetTicksUsec();
+		ulong target = start + (ulong)(time * 1_000_000.0);
+		if (target <= start)
+			return cancellationToken.IsCancellationRequested ? Task.FromCanceled(cancellationToken) : Task.CompletedTask;
 
-		while (Time.GetTicksUsec() < target)
-			await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+		ScheduledWait waiter = new();
+		if (cancellationToken.CanBeCanceled)
+		{
+			waiter.CancellationRegistration = cancellationToken.Register(
+				static state => ((ScheduledWait)state!).TrySetCanceled(), waiter);
+		}
+		_waitQueue.Enqueue(waiter, (target, _nextWaitOrder++));
+		if (!_processingWaits)
+			_ = ProcessWaits();
+
+		return waiter.Task;
+	}
+
+	private async Task ProcessWaits()
+	{
+		_processingWaits = true;
+		try
+		{
+			while (_waitQueue.Count > 0)
+			{
+				await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+
+				while (_waitQueue.TryPeek(out ScheduledWait? waiter, out var priority) &&
+					(waiter.Task.IsCompleted || priority.Target <= Time.GetTicksUsec()))
+				{
+					_waitQueue.Dequeue();
+					waiter.CancellationRegistration.Dispose();
+					waiter.TrySetResult(true);
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			while (_waitQueue.TryDequeue(out ScheduledWait? waiter, out _))
+			{
+				waiter.CancellationRegistration.Dispose();
+				waiter.TrySetException(ex);
+			}
+			PT.PrintErr("Failed to process scheduled waits: ", ex);
+		}
+		finally
+		{
+			_processingWaits = false;
+		}
+	}
+
+	private sealed class ScheduledWait : TaskCompletionSource<bool>
+	{
+		public CancellationTokenRegistration CancellationRegistration;
 	}
 
 	public async Task WaitFrame()
@@ -511,6 +585,8 @@ public sealed partial class Globals : Node
 			if (!await CreatorService.Interface.OnQuitRequested()) return;
 		}
 #endif
+
+		RuntimeExtensions.Shutdown();
 
 		// Starts quit the app
 		_isExiting = true;
